@@ -161,8 +161,27 @@ class MCPAgent(ToolCallAgent):
                 self.state = AgentState.FINISHED
                 return False
 
-        # Use the parent class's think method
-        return await super().think()
+        # 在调用父类think方法前，设置拦截器捕获思考过程
+        original_log_info = logger.info
+
+        def info_interceptor(message):
+            # 捕获思考过程并通知回调
+            if "✨" in message and "thoughts" in message:
+                # 提取思考内容
+                thought = message.split("✨")[1].strip()
+                self._notify_thinking(thought)
+            # 继续原始的日志输出
+            return original_log_info(message)
+
+        # 替换logger的info方法
+        logger.info = info_interceptor
+
+        try:
+            # Use the parent class's think method
+            return await super().think()
+        finally:
+            # 恢复原始logger方法
+            logger.info = original_log_info
 
     async def _handle_special_tool(self, name: str, result: Any, **kwargs) -> None:
         """Handle special tool execution and state changes"""
@@ -197,6 +216,23 @@ class MCPAgent(ToolCallAgent):
 
         self._notify_thinking("正在规划执行步骤...")
 
+        # 存储当前任务的取消检查函数
+        self._cancelled = False
+
+        # 定义一个检查是否取消的函数
+        def is_cancelled():
+            return self._cancelled
+
+        # 取消当前任务的函数
+        def cancel_run():
+            self._cancelled = True
+            self.state = AgentState.FINISHED
+            logger.info("用户取消了任务执行")
+
+        # 存储这些函数以便外部调用
+        setattr(self, "is_cancelled", is_cancelled)
+        setattr(self, "cancel_run", cancel_run)
+
         try:
             # 第一步思考：分析用户需求
             self._notify_thinking("分析用户需求，确定执行计划...")
@@ -224,8 +260,15 @@ class MCPAgent(ToolCallAgent):
             self.current_step = 0
             async with self.state_context(AgentState.RUNNING):
                 while (
-                    self.current_step < self.max_steps and self.state != AgentState.FINISHED
+                    self.current_step < self.max_steps and
+                    self.state != AgentState.FINISHED and
+                    not self._cancelled
                 ):
+                    # 检查任务是否被取消
+                    if self._cancelled:
+                        logger.info("检测到任务取消请求，停止执行")
+                        break
+
                     self.current_step += 1
                     logger.info(f"执行步骤 {self.current_step}/{self.max_steps}")
                     step_result = await self.step()
@@ -235,6 +278,15 @@ class MCPAgent(ToolCallAgent):
                         self.handle_stuck_state()
 
                     results.append(step_result)
+
+                    # 再次检查任务是否被取消
+                    if self._cancelled:
+                        logger.info("执行步骤后发现任务取消请求，停止执行")
+                        break
+
+            # 如果任务被取消，直接返回
+            if self._cancelled:
+                return "任务已被用户终止"
 
             # 最终思考：总结结果
             self._notify_thinking("任务执行完毕，正在总结结果...")
@@ -253,3 +305,9 @@ class MCPAgent(ToolCallAgent):
         except Exception as e:
             logger.error(f"Error running MCP agent: {str(e)}")
             return f"执行出错: {str(e)}"
+        finally:
+            # 清理取消相关属性
+            if hasattr(self, "is_cancelled"):
+                delattr(self, "is_cancelled")
+            if hasattr(self, "cancel_run"):
+                delattr(self, "cancel_run")

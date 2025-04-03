@@ -168,6 +168,9 @@ async def process_agent_response(agent, prompt, websocket, client_id):
             logger.info(f"客户端 {client_id} 的请求执行完成")
         except asyncio.CancelledError:
             logger.info(f"客户端 {client_id} 的请求被取消")
+            # 确保Agent内部也知道任务被取消
+            if hasattr(agent, 'cancel_run'):
+                agent.cancel_run()
             raise
         except Exception as e:
             logger.error(f"执行请求时出错: {str(e)}", exc_info=True)
@@ -290,9 +293,26 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
             elif data["type"] == "cancel":
                 # 处理取消请求
                 if client_id in active_tasks and not active_tasks[client_id].done():
+                    logger.info(f"客户端 {client_id} 请求终止任务")
                     cancel_flags[client_id] = True
+
+                    # 首先尝试调用agent的取消方法（内部取消）
+                    agent_in_use = active_agents.get(client_id)
+                    if agent_in_use and hasattr(agent_in_use, 'cancel_run'):
+                        try:
+                            agent_in_use.cancel_run()
+                            logger.info(f"已调用客户端 {client_id} 的agent取消方法")
+                        except Exception as e:
+                            logger.error(f"调用agent取消方法时出错: {str(e)}")
+
+                    # 然后取消任务（外部取消）
                     task = active_tasks[client_id]
-                    task.cancel()
+                    try:
+                        task.cancel()
+                        logger.info(f"已取消客户端 {client_id} 的任务")
+                    except Exception as e:
+                        logger.error(f"取消任务时出错: {str(e)}")
+
                     await websocket.send_json({
                         "type": "system",
                         "content": "正在终止任务..."

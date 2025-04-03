@@ -36,8 +36,11 @@
             border-left: 3px solid #9333ea;
             font-style: italic;
             margin: 0.5rem 0;
-            padding: 0.5rem;
+            padding: 0.75rem;
             font-size: 0.9rem;
+            white-space: pre-wrap;
+            word-break: break-word;
+            line-height: 1.5;
         }
 
         .typing-indicator {
@@ -110,6 +113,26 @@
 
         .cancel-button:hover {
             background-color: #dc2626;
+        }
+
+        .json-block {
+            background-color: #f5f5f5;
+            padding: 10px;
+            border-radius: 5px;
+            overflow-x: auto;
+            margin: 0.5rem 0;
+            font-family: monospace;
+            white-space: pre-wrap;
+            border: 1px solid #e0e0e0;
+        }
+
+        #thinking-content {
+            padding: 0.5rem;
+            margin-bottom: 1rem;
+            max-height: 300px;
+            overflow-y: auto;
+            border-radius: 8px;
+            background-color: rgba(147, 51, 234, 0.05);
         }
     </style>
 </head>
@@ -359,7 +382,37 @@
             const thinkingContent = document.getElementById('thinking-content');
             const stepDiv = document.createElement('div');
             stepDiv.className = 'thinking-step';
-            stepDiv.textContent = step;
+
+            // 格式化思考内容，支持代码块和JSON等格式
+            let formattedStep = step;
+
+            // 如果包含JSON代码块，尝试格式化它们
+            if (step.includes('```json') || step.includes('{') || step.includes('[')) {
+                try {
+                    // 尝试提取JSON
+                    const jsonMatch = step.match(/```json\s*([\s\S]*?)\s*```/) ||
+                        step.match(/\{[\s\S]*\}/) ||
+                        step.match(/\[[\s\S]*\]/);
+
+                    if (jsonMatch) {
+                        const jsonStr = jsonMatch[0];
+                        // 替换原来的JSON字符串为带格式的代码块
+                        formattedStep = step.replace(
+                            jsonStr,
+                            '<pre class="json-block"><code>' +
+                            jsonStr.replace(/</g, '&lt;').replace(/>/g, '&gt;') +
+                            '</code></pre>'
+                        );
+                    }
+                } catch (e) {
+                    console.error('格式化JSON出错:', e);
+                }
+            }
+
+            // 支持换行
+            formattedStep = formattedStep.replace(/\n/g, '<br>');
+
+            stepDiv.innerHTML = formattedStep;
             thinkingContent.appendChild(stepDiv);
 
             scrollToBottom();
