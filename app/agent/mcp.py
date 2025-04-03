@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from pydantic import Field
 
@@ -37,35 +37,36 @@ class MCPAgent(ToolCallAgent):
     # Special tool names that should trigger termination
     special_tool_names: List[str] = Field(default_factory=lambda: ["terminate"])
 
+    # 思考回调函数列表
+    _thinking_callbacks: List[Callable[[str], None]] = []
+
     async def initialize(
         self,
-        connection_type: Optional[str] = None,
+        connection_type: str = "stdio",
         server_url: Optional[str] = None,
         command: Optional[str] = None,
         args: Optional[List[str]] = None,
     ) -> None:
-        """Initialize the MCP connection.
+        """Initialize the agent with the specified connection to the MCP server."""
+        self.connection_type = connection_type
+        self.mcp_clients = MCPClients()
 
-        Args:
-            connection_type: Type of connection to use ("stdio" or "sse")
-            server_url: URL of the MCP server (for SSE connection)
-            command: Command to run (for stdio connection)
-            args: Arguments for the command (for stdio connection)
-        """
-        if connection_type:
-            self.connection_type = connection_type
+        try:
+            if connection_type == "stdio":
+                if not command:
+                    raise ValueError("Command is required for stdio connection")
+                await self.mcp_clients.connect_stdio(command, args or [])
+            elif connection_type == "sse":
+                if not server_url:
+                    raise ValueError("Server URL is required for SSE connection")
+                await self.mcp_clients.connect_sse(server_url)
+            else:
+                raise ValueError(f"Unsupported connection type: {connection_type}")
+        except Exception as e:
+            logger.error(f"Failed to initialize MCP agent: {str(e)}")
+            raise
 
-        # Connect to the MCP server based on connection type
-        if self.connection_type == "sse":
-            if not server_url:
-                raise ValueError("Server URL is required for SSE connection")
-            await self.mcp_clients.connect_sse(server_url=server_url)
-        elif self.connection_type == "stdio":
-            if not command:
-                raise ValueError("Command is required for stdio connection")
-            await self.mcp_clients.connect_stdio(command=command, args=args or [])
-        else:
-            raise ValueError(f"Unsupported connection type: {self.connection_type}")
+        self._thinking_callbacks = []
 
         # Set available_tools to our MCP instance
         self.available_tools = self.mcp_clients
@@ -83,6 +84,18 @@ class MCPAgent(ToolCallAgent):
                 f"{self.system_prompt}\n\nAvailable MCP tools: {tools_info}"
             )
         )
+
+    def add_thinking_callback(self, callback: Callable[[str], None]) -> None:
+        """添加思考过程回调函数"""
+        self._thinking_callbacks.append(callback)
+
+    def _notify_thinking(self, step: str) -> None:
+        """通知所有回调函数有新的思考步骤"""
+        for callback in self._thinking_callbacks:
+            try:
+                callback(step)
+            except Exception as e:
+                logger.error(f"Error in thinking callback: {str(e)}")
 
     async def _refresh_tools(self) -> Tuple[List[str], List[str]]:
         """Refresh the list of available tools from the MCP server.
@@ -174,12 +187,69 @@ class MCPAgent(ToolCallAgent):
         if self.mcp_clients.session:
             await self.mcp_clients.disconnect()
             logger.info("MCP connection closed")
+        self.mcp_clients = None
+        self._thinking_callbacks = []
 
-    async def run(self, request: Optional[str] = None) -> str:
-        """Run the agent with cleanup when done."""
+    async def run(self, prompt: str) -> str:
+        """Run the agent with the given prompt."""
+        if not self.mcp_clients:
+            raise RuntimeError("Agent not initialized")
+
+        self._notify_thinking("正在规划执行步骤...")
+
         try:
-            result = await super().run(request)
-            return result
-        finally:
-            # Ensure cleanup happens even if there's an error
-            await self.cleanup()
+            # 第一步思考：分析用户需求
+            self._notify_thinking("分析用户需求，确定执行计划...")
+
+            # 检查工具可用性
+            bash_tool = self.mcp_clients.get_tool("bash")
+            browser_tool = self.mcp_clients.get_tool("browser")
+
+            # 检查是否需要使用特定工具
+            if browser_tool and ("搜索" in prompt or "浏览" in prompt or "网页" in prompt):
+                self._notify_thinking("检查是否需要浏览器能力...")
+                self._notify_thinking("准备使用浏览器能力处理请求...")
+
+            # 准备工具调用
+            self._notify_thinking("确定最适合的工具和方法...")
+
+            # 添加用户消息
+            self.memory.add_message(Message.user_message(prompt))
+
+            # 执行实际任务 - 使用父类ToolCallAgent的方法
+            self._notify_thinking("开始执行用户请求...")
+
+            # 使用父类的执行方法 - 使用BaseAgent的核心执行流程
+            results = []
+            self.current_step = 0
+            async with self.state_context(AgentState.RUNNING):
+                while (
+                    self.current_step < self.max_steps and self.state != AgentState.FINISHED
+                ):
+                    self.current_step += 1
+                    logger.info(f"执行步骤 {self.current_step}/{self.max_steps}")
+                    step_result = await self.step()
+
+                    # 检查是否卡住
+                    if self.is_stuck():
+                        self.handle_stuck_state()
+
+                    results.append(step_result)
+
+            # 最终思考：总结结果
+            self._notify_thinking("任务执行完毕，正在总结结果...")
+
+            # 获取最终响应 - 优先使用最后一个助手消息
+            final_response = self.memory.get_last_assistant_message()
+            if final_response:
+                return final_response.content
+
+            # 如果没有助手消息，则返回步骤结果
+            if results:
+                return "\n".join(results)
+
+            return "完成，但没有生成响应。"
+
+        except Exception as e:
+            logger.error(f"Error running MCP agent: {str(e)}")
+            return f"执行出错: {str(e)}"

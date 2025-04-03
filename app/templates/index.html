@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OpenManus Web 界面</title>
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+    <style>
+        .chat-container {
+            height: calc(100vh - 180px);
+            overflow-y: auto;
+            scroll-behavior: smooth;
+        }
+
+        .user-message {
+            background-color: #e9f5ff;
+            border-radius: 18px 18px 4px 18px;
+        }
+
+        .bot-message {
+            background-color: #f0f0f0;
+            border-radius: 18px 18px 18px 4px;
+        }
+
+        .system-message {
+            background-color: #fff7e0;
+            border-radius: 8px;
+            font-style: italic;
+        }
+
+        .thinking-step {
+            background-color: #f9f2ff;
+            border-radius: 8px;
+            border-left: 3px solid #9333ea;
+            font-style: italic;
+            margin: 0.5rem 0;
+            padding: 0.5rem;
+            font-size: 0.9rem;
+        }
+
+        .typing-indicator {
+            display: inline-block;
+        }
+
+        .typing-indicator span {
+            display: inline-block;
+            height: 8px;
+            width: 8px;
+            background-color: #555;
+            border-radius: 50%;
+            animation: typing 1.4s infinite ease-in-out;
+            margin: 0 2px;
+        }
+
+        .typing-indicator span:nth-child(2) {
+            animation-delay: 0.2s;
+        }
+
+        .typing-indicator span:nth-child(3) {
+            animation-delay: 0.4s;
+        }
+
+        @keyframes typing {
+
+            0%,
+            100% {
+                transform: translateY(0);
+            }
+
+            50% {
+                transform: translateY(-5px);
+            }
+        }
+
+        pre {
+            background-color: #f5f5f5;
+            padding: 10px;
+            border-radius: 5px;
+            overflow-x: auto;
+        }
+
+        code {
+            font-family: monospace;
+            white-space: pre-wrap;
+        }
+
+        .thinking-container {
+            margin-bottom: 0.5rem;
+        }
+
+        .thinking-container .thinking-header {
+            display: flex;
+            align-items: center;
+            cursor: pointer;
+            padding: 4px;
+            font-size: 0.8rem;
+            color: #9333ea;
+        }
+
+        .cancel-button {
+            background-color: #ef4444;
+            color: white;
+            border-radius: 0.5rem;
+            padding: 0.5rem 1rem;
+            margin-right: 0.5rem;
+            display: none;
+        }
+
+        .cancel-button:hover {
+            background-color: #dc2626;
+        }
+    </style>
+</head>
+
+<body class="bg-gray-100">
+    <div class="container mx-auto p-4 max-w-4xl">
+        <header class="bg-gradient-to-r from-blue-600 to-indigo-600 text-white p-4 rounded-lg shadow-lg mb-4">
+            <div class="flex items-center justify-between">
+                <h1 class="text-2xl font-bold">OpenManus Web 界面</h1>
+                <div class="flex items-center">
+                    <a href="/history"
+                        class="bg-white text-blue-600 px-3 py-1 rounded hover:bg-blue-100 transition mr-4">
+                        <i class="fas fa-history mr-1"></i>历史记录
+                    </a>
+                    <div>
+                        <span id="status-indicator" class="inline-block w-3 h-3 bg-red-500 rounded-full mr-2"></span>
+                        <span id="connection-status">未连接</span>
+                    </div>
+                </div>
+            </div>
+        </header>
+
+        <div class="chat-container bg-white p-4 rounded-lg shadow mb-4" id="chat-container">
+            <div class="system-message p-3 mb-4 text-center">
+                欢迎使用 OpenManus Web 界面！正在尝试连接...
+            </div>
+        </div>
+
+        <div class="bg-white p-4 rounded-lg shadow">
+            <form id="prompt-form" class="flex gap-2">
+                <button type="button" id="cancel-button" class="cancel-button">
+                    <i class="fas fa-stop-circle mr-1"></i>终止
+                </button>
+                <input type="text" id="prompt-input" placeholder="输入您的问题或指令..."
+                    class="flex-grow px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                <button type="submit" id="send-button"
+                    class="bg-blue-600 hover:bg-blue-700 text-white px-6 py-2 rounded-lg transition duration-200 flex items-center">
+                    <i class="fas fa-paper-plane mr-2"></i> 发送
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        // 生成唯一的客户端ID
+        const clientId = 'client_' + Math.random().toString(36).substring(2, 10);
+        let socket = null;
+        let reconnectAttempts = 0;
+        const maxReconnectAttempts = 5;
+        let isProcessing = false;
+        let currentThinkingSteps = [];
+
+        // 初始化WebSocket连接
+        function initWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws/${clientId}`;
+
+            socket = new WebSocket(wsUrl);
+
+            socket.onopen = function (event) {
+                updateConnectionStatus(true);
+                addSystemMessage('已连接到服务器，请输入您的指令！');
+                reconnectAttempts = 0;
+            };
+
+            socket.onmessage = function (event) {
+                const data = JSON.parse(event.data);
+
+                if (data.type === 'system') {
+                    addSystemMessage(data.content);
+
+                    // 如果收到"正在处理您的请求..."，则开始处理状态
+                    if (data.content === "正在处理您的请求...") {
+                        startProcessing();
+                    }
+
+                    // 如果收到"任务已被终止"，则结束处理状态
+                    if (data.content === "任务已被终止" || data.content === "没有正在运行的任务可终止") {
+                        stopProcessing();
+                    }
+                } else if (data.type === 'response') {
+                    addBotMessage(data.content);
+                    stopProcessing();
+                } else if (data.type === 'error') {
+                    addErrorMessage(data.content);
+                    stopProcessing();
+                } else if (data.type === 'thinking') {
+                    // 处理思考步骤
+                    addThinkingStep(data.content);
+                }
+            };
+
+            socket.onclose = function (event) {
+                updateConnectionStatus(false);
+                addSystemMessage('连接已断开');
+                stopProcessing();
+
+                // 尝试重新连接
+                if (reconnectAttempts < maxReconnectAttempts) {
+                    reconnectAttempts++;
+                    addSystemMessage(`尝试重新连接 (${reconnectAttempts}/${maxReconnectAttempts})...`);
+                    setTimeout(initWebSocket, 2000);
+                } else {
+                    addErrorMessage('无法连接到服务器，请刷新页面重试。');
+                }
+            };
+
+            socket.onerror = function (error) {
+                console.error('WebSocket Error:', error);
+                addErrorMessage('连接出错，请稍后重试。');
+                stopProcessing();
+            };
+        }
+
+        // 更新连接状态指示器
+        function updateConnectionStatus(connected) {
+            const statusIndicator = document.getElementById('status-indicator');
+            const connectionStatus = document.getElementById('connection-status');
+
+            if (connected) {
+                statusIndicator.classList.remove('bg-red-500');
+                statusIndicator.classList.add('bg-green-500');
+                connectionStatus.textContent = '已连接';
+            } else {
+                statusIndicator.classList.remove('bg-green-500');
+                statusIndicator.classList.add('bg-red-500');
+                connectionStatus.textContent = '未连接';
+            }
+        }
+
+        // 开始处理状态
+        function startProcessing() {
+            isProcessing = true;
+
+            // 设置输入表单状态
+            const inputField = document.getElementById('prompt-input');
+            const sendButton = document.getElementById('send-button');
+            const cancelButton = document.getElementById('cancel-button');
+
+            inputField.disabled = true;
+            sendButton.disabled = true;
+            sendButton.classList.add('opacity-50');
+            cancelButton.style.display = 'block';
+
+            // 清空当前思考步骤
+            currentThinkingSteps = [];
+        }
+
+        // 结束处理状态
+        function stopProcessing() {
+            isProcessing = false;
+
+            // 恢复输入表单状态
+            const inputField = document.getElementById('prompt-input');
+            const sendButton = document.getElementById('send-button');
+            const cancelButton = document.getElementById('cancel-button');
+
+            inputField.disabled = false;
+            sendButton.disabled = false;
+            sendButton.classList.remove('opacity-50');
+            cancelButton.style.display = 'none';
+
+            // 移除加载指示器
+            removeTypingIndicator();
+
+            // 清空思考步骤
+            currentThinkingSteps = [];
+        }
+
+        // 添加用户消息到聊天容器
+        function addUserMessage(message) {
+            const chatContainer = document.getElementById('chat-container');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'user-message p-3 mb-3 self-end ml-10';
+            messageDiv.innerHTML = `<p class="mb-1">${formatMessage(message)}</p>`;
+            chatContainer.appendChild(messageDiv);
+            scrollToBottom();
+        }
+
+        // 添加机器人消息到聊天容器
+        function addBotMessage(message) {
+            removeTypingIndicator();
+
+            const chatContainer = document.getElementById('chat-container');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'bot-message p-3 mb-3 mr-10';
+            messageDiv.innerHTML = `<p class="mb-1">${formatMessage(message)}</p>`;
+            chatContainer.appendChild(messageDiv);
+            scrollToBottom();
+        }
+
+        // 添加系统消息到聊天容器
+        function addSystemMessage(message) {
+            const chatContainer = document.getElementById('chat-container');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'system-message p-2 mb-3 text-center text-sm text-gray-600';
+            messageDiv.textContent = message;
+            chatContainer.appendChild(messageDiv);
+            scrollToBottom();
+        }
+
+        // 添加错误消息到聊天容器
+        function addErrorMessage(message) {
+            removeTypingIndicator();
+
+            const chatContainer = document.getElementById('chat-container');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'system-message p-2 mb-3 text-center text-sm text-red-600 bg-red-100';
+            messageDiv.textContent = '错误: ' + message;
+            chatContainer.appendChild(messageDiv);
+            scrollToBottom();
+        }
+
+        // 添加思考步骤
+        function addThinkingStep(step) {
+            // 保存步骤
+            currentThinkingSteps.push(step);
+
+            const chatContainer = document.getElementById('chat-container');
+
+            // 先找或创建思考容器
+            let thinkingContainer = document.getElementById('thinking-container');
+            if (!thinkingContainer) {
+                // 创建思考步骤容器
+                thinkingContainer = document.createElement('div');
+                thinkingContainer.id = 'thinking-container';
+                thinkingContainer.className = 'thinking-container mr-10';
+
+                // 创建思考步骤标题
+                const thinkingHeader = document.createElement('div');
+                thinkingHeader.className = 'thinking-header';
+                thinkingHeader.innerHTML = `
+                    <i class="fas fa-brain mr-1"></i>
+                    <span>思考过程</span>
+                `;
+                thinkingContainer.appendChild(thinkingHeader);
+
+                // 创建思考步骤内容区域
+                const thinkingContent = document.createElement('div');
+                thinkingContent.id = 'thinking-content';
+                thinkingContainer.appendChild(thinkingContent);
+
+                chatContainer.appendChild(thinkingContainer);
+            }
+
+            // 添加新的思考步骤
+            const thinkingContent = document.getElementById('thinking-content');
+            const stepDiv = document.createElement('div');
+            stepDiv.className = 'thinking-step';
+            stepDiv.textContent = step;
+            thinkingContent.appendChild(stepDiv);
+
+            scrollToBottom();
+        }
+
+        // 显示输入中指示器
+        function showTypingIndicator() {
+            // 先移除已有的输入指示器
+            removeTypingIndicator();
+
+            const chatContainer = document.getElementById('chat-container');
+            const typingDiv = document.createElement('div');
+            typingDiv.id = 'typing-indicator';
+            typingDiv.className = 'bot-message p-3 mb-3 mr-10 inline-block';
+            typingDiv.innerHTML = `
+                <div class="typing-indicator">
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                </div>
+            `;
+            chatContainer.appendChild(typingDiv);
+            scrollToBottom();
+        }
+
+        // 移除输入中指示器
+        function removeTypingIndicator() {
+            const typingIndicator = document.getElementById('typing-indicator');
+            if (typingIndicator) {
+                typingIndicator.remove();
+            }
+
+            // 同时移除思考容器
+            const thinkingContainer = document.getElementById('thinking-container');
+            if (thinkingContainer) {
+                thinkingContainer.remove();
+            }
+        }
+
+        // 滚动到聊天容器底部
+        function scrollToBottom() {
+            const chatContainer = document.getElementById('chat-container');
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+
+        // 格式化消息，支持代码块
+        function formatMessage(message) {
+            // 保护输入以防XSS攻击
+            let safeMessage = message
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#039;');
+
+            // 支持代码块格式化
+            safeMessage = safeMessage.replace(/```([\s\S]*?)```/g, '<pre><code>$1</code></pre>');
+
+            // 支持换行
+            safeMessage = safeMessage.replace(/\n/g, '<br>');
+
+            return safeMessage;
+        }
+
+        // 发送消息到服务器
+        function sendMessage(message) {
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                const data = {
+                    type: 'prompt',
+                    content: message
+                };
+                socket.send(JSON.stringify(data));
+                showTypingIndicator();
+            } else {
+                addErrorMessage('未连接到服务器，无法发送消息。');
+            }
+        }
+
+        // 发送终止请求
+        function sendCancelRequest() {
+            if (socket && socket.readyState === WebSocket.OPEN && isProcessing) {
+                const data = {
+                    type: 'cancel',
+                    content: ''
+                };
+                socket.send(JSON.stringify(data));
+                addSystemMessage('已发送终止请求...');
+            }
+        }
+
+        // 处理表单提交
+        document.getElementById('prompt-form').addEventListener('submit', function (e) {
+            e.preventDefault();
+
+            // 如果正在处理中，不允许发送新消息
+            if (isProcessing) {
+                return;
+            }
+
+            const inputField = document.getElementById('prompt-input');
+            const message = inputField.value.trim();
+
+            if (message) {
+                addUserMessage(message);
+                sendMessage(message);
+                inputField.value = '';
+            }
+        });
+
+        // 处理终止按钮点击
+        document.getElementById('cancel-button').addEventListener('click', function () {
+            sendCancelRequest();
+        });
+
+        // 初始化WebSocket连接
+        window.addEventListener('load', initWebSocket);
+    </script>
+</body>
+
+</html>
