@@ -17,6 +17,7 @@ from datetime import datetime
 from app.agent.mcp import MCPAgent
 from app.agent.manus import Manus
 from app.logger import logger
+from app.schema import AgentState
 
 # 创建FastAPI应用
 app = FastAPI(title="OpenManus Web Interface")
@@ -127,6 +128,26 @@ async def get_history_detail(history_id: str):
         return conversation
     return {"error": "历史记录不存在"}
 
+def safe_serialize(obj):
+    """安全序列化对象为JSON，处理不可序列化的情况"""
+    if obj is None:
+        return None
+
+    if isinstance(obj, (str, int, float, bool)):
+        return obj
+
+    if isinstance(obj, (list, tuple)):
+        return [safe_serialize(item) for item in obj]
+
+    if isinstance(obj, dict):
+        return {str(k): safe_serialize(v) for k, v in obj.items()}
+
+    # 其他类型转为字符串
+    try:
+        return str(obj)
+    except:
+        return "无法序列化的对象"
+
 async def process_agent_response(agent, prompt, websocket, client_id):
     """处理代理响应，并展示思考过程"""
     # 设置标志以便可以取消
@@ -166,6 +187,13 @@ async def process_agent_response(agent, prompt, websocket, client_id):
         try:
             response = await task
             logger.info(f"客户端 {client_id} 的请求执行完成")
+
+            # 检查响应是否为None或空字符串
+            if response is None:
+                response = "任务已执行，但未能生成有效响应。"
+            elif isinstance(response, str) and not response.strip():
+                response = "任务已执行，但返回了空结果。"
+
         except asyncio.CancelledError:
             logger.info(f"客户端 {client_id} 的请求被取消")
             # 确保Agent内部也知道任务被取消
@@ -180,25 +208,51 @@ async def process_agent_response(agent, prompt, websocket, client_id):
             })
             raise
 
-        # 如果任务被取消，则不发送响应
+        # 检查agent的状态
+        agent_finished = False
+        if hasattr(agent, 'state'):
+            agent_finished = agent.state == AgentState.FINISHED
+            if agent_finished:
+                logger.info(f"客户端 {client_id} 的任务已终止，状态: {agent.state}")
+
+        # 如果任务被取消或自动终止，则发送相应消息
         if cancel_flags[client_id]:
             await websocket.send_json({
                 "type": "system",
-                "content": "任务已被终止"
+                "content": "任务已被用户终止"
             })
             return None
+        elif agent_finished and (response == "任务已被用户终止" or "终止" in response):
+            await websocket.send_json({
+                "type": "system",
+                "content": "任务已完成并终止"
+            })
 
         # 发送最终响应
-        await websocket.send_json({
-            "type": "response",
-            "content": response
-        })
+        try:
+            # 安全序列化响应内容
+            safe_response = safe_serialize(response)
 
-        return {
-            "prompt": prompt,
-            "response": response,
-            "thinking_steps": thinking_steps
-        }
+            await websocket.send_json({
+                "type": "response",
+                "content": safe_response
+            })
+
+            return {
+                "prompt": prompt,
+                "response": safe_response,
+                "thinking_steps": thinking_steps
+            }
+        except Exception as e:
+            logger.error(f"发送响应时出错: {str(e)}", exc_info=True)
+            try:
+                await websocket.send_json({
+                    "type": "error",
+                    "content": f"发送结果时出错: {str(e)}"
+                })
+            except:
+                logger.error("无法发送错误消息")
+            return None
 
     except asyncio.CancelledError:
         logger.info(f"客户端 {client_id} 的请求处理被取消")
@@ -272,11 +326,11 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     result = await process_agent_response(agent, prompt, websocket, client_id)
 
                     if result:
-                        # 记录响应消息
+                        # 记录响应消息 - 使用安全序列化后的响应
                         chat_messages.append({
                             "role": "assistant",
                             "content": result["response"],
-                            "thinking": result.get("thinking_steps", []),
+                            "thinking": safe_serialize(result.get("thinking_steps", [])),
                             "timestamp": datetime.now().isoformat()
                         })
 
@@ -342,7 +396,16 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
         # 保存聊天历史
         if len(chat_messages) > 0:
             try:
-                ChatHistory.save_conversation(client_id, chat_messages)
+                # 确保历史消息可以被安全序列化
+                safe_messages = []
+                for msg in chat_messages:
+                    safe_messages.append({
+                        "role": msg["role"],
+                        "content": safe_serialize(msg["content"]),
+                        "thinking": safe_serialize(msg.get("thinking", [])),
+                        "timestamp": msg["timestamp"]
+                    })
+                ChatHistory.save_conversation(client_id, safe_messages)
             except Exception as e:
                 logger.error(f"保存聊天历史时出错: {str(e)}")
 

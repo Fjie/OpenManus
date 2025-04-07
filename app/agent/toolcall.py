@@ -77,6 +77,9 @@ class ToolCallAgent(ReActAgent):
         )
         content = response.content if response and response.content else ""
 
+        # 记录工具选择状态
+        self._last_tools_selected = bool(tool_calls)
+
         # Log response info
         logger.info(f"✨ {self.name}'s thoughts: {content}")
         logger.info(

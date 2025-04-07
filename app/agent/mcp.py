@@ -258,11 +258,15 @@ class MCPAgent(ToolCallAgent):
             # 使用父类的执行方法 - 使用BaseAgent的核心执行流程
             results = []
             self.current_step = 0
+            no_tool_selected_count = 0  # 跟踪连续没有工具被选择的次数
+            terminate_intent_detected = False  # 跟踪是否检测到终止意图
+
             async with self.state_context(AgentState.RUNNING):
                 while (
                     self.current_step < self.max_steps and
                     self.state != AgentState.FINISHED and
-                    not self._cancelled
+                    not self._cancelled and
+                    not terminate_intent_detected  # 新增检查终止意图
                 ):
                     # 检查任务是否被取消
                     if self._cancelled:
@@ -273,11 +277,42 @@ class MCPAgent(ToolCallAgent):
                     logger.info(f"执行步骤 {self.current_step}/{self.max_steps}")
                     step_result = await self.step()
 
+                    # 检查步骤结果中是否包含终止意图
+                    last_message = self.memory.get_last_assistant_message()
+                    if last_message and last_message.content:
+                        content_lower = last_message.content.lower()
+                        # 检查消息中是否存在表达终止的关键词
+                        if "terminate" in content_lower or "任务已完成" in content_lower or "会话将结束" in content_lower:
+                            logger.info("检测到终止意图，停止执行")
+                            terminate_intent_detected = True
+                            break
+
+                    # 检查最后一个思考过程中是否包含JSON工具调用且包含terminate
+                    last_thinking = self._thinking_callbacks[-1] if self._thinking_callbacks else None
+                    if last_thinking and isinstance(last_thinking, str):
+                        if '```json' in last_thinking and '"status": "success"' in last_thinking:
+                            logger.info("检测到终止JSON，停止执行")
+                            terminate_intent_detected = True
+                            break
+
                     # 检查是否卡住
                     if self.is_stuck():
                         self.handle_stuck_state()
 
-                    results.append(step_result)
+                    # 检查是否连续多次没有选择工具
+                    if hasattr(self, '_last_tools_selected') and not self._last_tools_selected:
+                        no_tool_selected_count += 1
+                    else:
+                        no_tool_selected_count = 0
+
+                    # 如果连续3次没有选择工具，认为任务已完成
+                    if no_tool_selected_count >= 3:
+                        logger.info("连续多次没有选择工具，认为任务已完成")
+                        break
+
+                    # 只保存非None和非空的步骤结果
+                    if step_result is not None and step_result != "":
+                        results.append(step_result)
 
                     # 再次检查任务是否被取消
                     if self._cancelled:
@@ -293,14 +328,38 @@ class MCPAgent(ToolCallAgent):
 
             # 获取最终响应 - 优先使用最后一个助手消息
             final_response = self.memory.get_last_assistant_message()
-            if final_response:
+            if final_response and final_response.content and final_response.content.strip():
                 return final_response.content
 
-            # 如果没有助手消息，则返回步骤结果
+            # 如果没有有效的助手消息，则尝试构建一个总结
             if results:
-                return "\n".join(results)
+                try:
+                    # 如果结果不多，直接连接
+                    if len(results) <= 3:
+                        return "\n\n".join(r for r in results if r)
 
-            return "完成，但没有生成响应。"
+                    # 如果结果较多，提取重点内容
+                    result_summary = f"已完成，共执行了{len(results)}个步骤。主要结果:\n\n"
+                    # 添加前2个和最后2个结果
+                    for i, res in enumerate(results[:2]):
+                        if res and res.strip():
+                            result_summary += f"• 步骤{i+1}: {res.strip()[:150]}...\n"
+
+                    result_summary += "...\n"
+
+                    for i, res in enumerate(results[-2:]):
+                        idx = len(results) - 2 + i + 1
+                        if res and res.strip():
+                            result_summary += f"• 步骤{idx}: {res.strip()[:150]}...\n"
+
+                    return result_summary
+                except Exception as e:
+                    logger.error(f"构建结果摘要时出错: {str(e)}")
+                    # 备选方案：返回最后一个结果
+                    return results[-1] if results else "任务已完成，但未能生成有效结果。"
+
+            # 如果什么都没有，返回安全的默认消息
+            return "完成任务，但未能生成有效响应。请查看思考过程了解执行详情。"
 
         except Exception as e:
             logger.error(f"Error running MCP agent: {str(e)}")
